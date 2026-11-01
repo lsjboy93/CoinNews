@@ -1,4 +1,5 @@
 telegram.env
+state.json
 reports/
 site/
 __pycache__/

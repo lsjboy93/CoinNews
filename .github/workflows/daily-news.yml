@@ -2,8 +2,15 @@ name: Daily coin news
 
 on:
   schedule:
-    - cron: "0 23 * * *"   # 매일 08:00 KST (23:00 UTC)
-  workflow_dispatch:        # Actions 탭에서 수동 실행
+    - cron: "17,47 * * * *"  # 약 30분마다: 새 기사만 알림
+    - cron: "0 23 * * *"     # 매일 08:00 KST (23:00 UTC): 하루 요약
+  workflow_dispatch:          # Actions 탭에서 수동 실행
+    inputs:
+      telegram:
+        description: "텔레그램 전송 방식"
+        type: choice
+        options: [new, digest]
+        default: new
 
 permissions:
   contents: read
@@ -29,14 +36,30 @@ jobs:
         with:
           python-version: "3.12"
 
+      # 이미 알린 기사와 번역 결과를 실행 사이에 이어서 씀
+      - name: Restore state
+        uses: actions/cache/restore@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
+          restore-keys: state-
+
       - name: Build report and send Telegram
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MODE: ${{ github.event.schedule == '0 23 * * *' && 'digest' || inputs.telegram || 'new' }}
         run: |
           export REPORT_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
-          python coin_news.py --hours 24 --no-open --telegram --out site
+          python coin_news.py --hours 24 --no-open --telegram "$MODE" --out site
           cp site/*.html site/index.html
+
+      - name: Save state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state.json
+          key: state-${{ github.run_id }}
 
       - uses: actions/upload-pages-artifact@v3
         with:

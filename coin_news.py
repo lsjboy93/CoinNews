@@ -8,6 +8,7 @@
     python coin_news.py --hours 24 # 최근 24시간 기사
     python coin_news.py --no-open  # 브라우저 열지 않기 (예약 실행용)
     python coin_news.py --telegram # 텔레그램으로 요약 전송
+    python coin_news.py --telegram new  # 지난 실행 이후 새로 잡힌 기사만 알림
     python coin_news.py --get-chat-id  # 봇에게 메시지 보낸 뒤 내 chat id 확인
 
 텔레그램 설정은 환경변수 TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID 또는
@@ -173,19 +174,52 @@ def translate_ko(text):
         return None
 
 
-def translate_articles(grouped):
-    """영문 기사의 제목·요약을 번역해 title_ko / desc_ko 에 저장. 번역 실패 시 원문 유지."""
+def translate_articles(grouped, cache):
+    """영문 기사의 제목·요약을 번역해 title_ko / desc_ko 에 저장. 번역 실패 시 원문 유지.
+
+    cache(원문 → 번역)에 있는 문장은 다시 요청하지 않고, 이번에 쓴 번역만 담은 새 cache를 돌려줍니다.
+    """
     arts = [a for v in grouped.values() for a in v if not HANGUL.search(a["title"])]
+    new_cache, requested = {}, 0
+
+    def tr(text):
+        nonlocal requested
+        if text in cache:
+            ko = cache[text]
+        else:
+            requested += 1
+            ko = translate_ko(text)
+        if ko:
+            new_cache[text] = ko
+        return ko
 
     def work(a):
-        a["title_ko"] = translate_ko(a["title"])
+        a["title_ko"] = tr(a["title"])
         if a["desc"]:
-            a["desc_ko"] = translate_ko(short_desc(a["desc"]))
+            a["desc_ko"] = tr(short_desc(a["desc"]))
 
     with ThreadPoolExecutor(max_workers=6) as ex:
         list(ex.map(work, arts))
     done = sum(1 for a in arts if a.get("title_ko"))
-    print(f"  [번역] {done}/{len(arts)}건 번역")
+    print(f"  [번역] {done}/{len(arts)}건 번역 (새 요청 {requested}건)")
+    return new_cache
+
+
+def load_state(path):
+    try:
+        state = json.loads(path.read_text(encoding="utf-8"))
+    except (FileNotFoundError, ValueError):
+        state = {}
+    state.setdefault("seen", {})
+    state.setdefault("tr", {})
+    return state
+
+
+def save_state(path, state, now, keep_days=4):
+    cutoff = (now - timedelta(days=keep_days)).isoformat()
+    state["seen"] = {k: t for k, t in state["seen"].items() if t >= cutoff}
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
 def build_html(grouped, errors, hours, now):
@@ -260,10 +294,8 @@ def telegram_api(token, method, payload=None):
         return json.loads(resp.read())
 
 
-def build_telegram_messages(grouped, hours, now, report_url, per_cat=8):
+def build_telegram_messages(grouped, header, report_url, per_cat=8):
     """카테고리별 상위 기사만 담은 메시지 목록 (텔레그램 4096자 제한에 맞춰 분할)."""
-    total = sum(len(v) for v in grouped.values())
-    header = f"<b>📰 코인 기술·보안 브리핑</b>\n{now:%Y-%m-%d %H:%M} · 최근 {hours}시간 · {total}건"
     blocks = []
     for cat in CATEGORIES:
         arts = grouped.get(cat, [])
@@ -291,16 +323,21 @@ def build_telegram_messages(grouped, hours, now, report_url, per_cat=8):
     return messages
 
 
-def send_telegram(grouped, hours, now, report_url):
+def send_telegram(grouped, header, report_url):
+    """전송했거나 설정이 없어 건너뛰면 True, 전송 중 오류면 False."""
     token, chat_id = load_telegram_config()
     if not token or not chat_id:
         print("  [텔레그램] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 가 설정되지 않아 건너뜀", file=sys.stderr)
+        return True
+    try:
+        for msg in build_telegram_messages(grouped, header, report_url):
+            telegram_api(token, "sendMessage", {
+                "chat_id": chat_id, "text": msg, "parse_mode": "HTML",
+                "disable_web_page_preview": True,
+            })
+    except Exception as e:
+        print(f"  [텔레그램] 전송 실패: {e}", file=sys.stderr)
         return False
-    for msg in build_telegram_messages(grouped, hours, now, report_url):
-        telegram_api(token, "sendMessage", {
-            "chat_id": chat_id, "text": msg, "parse_mode": "HTML",
-            "disable_web_page_preview": True,
-        })
     print("  [텔레그램] 전송 완료")
     return True
 
@@ -326,7 +363,10 @@ def main():
     ap.add_argument("--hours", type=int, default=48, help="몇 시간 이내 기사만 볼지 (기본 48)")
     ap.add_argument("--no-open", action="store_true", help="리포트를 브라우저로 열지 않음")
     ap.add_argument("--out", type=Path, default=OUT_DIR, help="리포트 저장 폴더 (기본: 스크립트 옆 reports)")
-    ap.add_argument("--telegram", action="store_true", help="텔레그램으로 요약 전송")
+    ap.add_argument("--telegram", nargs="?", const="digest", choices=["digest", "new"],
+                    help="텔레그램 전송: digest=전체 요약(기본), new=지난 실행 이후 새 기사만")
+    ap.add_argument("--state", type=Path, default=Path(__file__).resolve().parent / "state.json",
+                    help="이미 본 기사·번역 캐시 저장 파일")
     ap.add_argument("--report-url", default=os.environ.get("REPORT_URL", ""),
                     help="텔레그램 메시지에 붙일 전체 리포트 주소")
     ap.add_argument("--get-chat-id", action="store_true", help="봇에게 온 메시지에서 chat id 출력")
@@ -370,8 +410,9 @@ def main():
     for arts in grouped.values():
         arts.sort(key=lambda a: a["published"] or oldest, reverse=True)
 
+    state = load_state(args.state)
     if not args.no_translate:
-        translate_articles(grouped)
+        state["tr"] = translate_articles(grouped, state["tr"])
 
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out / f"{now:%Y-%m-%d}.html"
@@ -385,11 +426,35 @@ def main():
     for name, err in errors:
         print(f"  [실패] {name}: {err}", file=sys.stderr)
 
-    if args.telegram:
-        send_telegram(grouped, args.hours, now, args.report_url)
+    def key(a):
+        return a["link"] or a["title"].lower()
+
+    first_run = not state["seen"]
+    ok = True
+    if args.telegram == "digest":
+        header = f"<b>📰 코인 기술·보안 브리핑</b>\n{now:%Y-%m-%d %H:%M} · 최근 {args.hours}시간 · {total}건"
+        ok = send_telegram(grouped, header, args.report_url)
+    elif args.telegram == "new":
+        fresh = {c: [a for a in v if key(a) not in state["seen"]] for c, v in grouped.items()}
+        fresh = {c: v for c, v in fresh.items() if v}
+        n = sum(len(v) for v in fresh.values())
+        if first_run:
+            print(f"  [텔레그램] 첫 실행: 기존 기사 {n}건을 기록만 하고 알림은 보내지 않음")
+        elif n:
+            ok = send_telegram(fresh, f"<b>🔔 새 소식 {n}건</b>", args.report_url)
+        else:
+            print("  [텔레그램] 새 기사 없음")
+
+    if ok:  # 전송에 실패하면 기록하지 않아 다음 실행 때 다시 보냄
+        stamp = now.isoformat()
+        for a in (a for v in grouped.values() for a in v):
+            state["seen"].setdefault(key(a), stamp)
+    save_state(args.state, state, now)
 
     if not args.no_open:
         webbrowser.open(out.as_uri())
+    if not ok:
+        sys.exit(1)
 
 
 if __name__ == "__main__":
