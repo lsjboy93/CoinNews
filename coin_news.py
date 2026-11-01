@@ -20,6 +20,7 @@ import json
 import os
 import re
 import sys
+import urllib.parse
 import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET
@@ -149,6 +150,44 @@ def classify(article):
     return None, None
 
 
+def short_desc(text, n=220):
+    return text[:n] + ("…" if len(text) > n else "")
+
+
+HANGUL = re.compile("[가-힣]")
+
+
+def translate_ko(text):
+    """Google 번역 웹 엔드포인트(무료, 키 불필요)로 한국어 번역. 실패하면 None."""
+    if not text or HANGUL.search(text):
+        return None
+    url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(
+        {"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": text})
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        out = "".join(seg[0] for seg in data[0] if seg and seg[0])
+        return out.replace("​", "").strip() or None
+    except Exception:
+        return None
+
+
+def translate_articles(grouped):
+    """영문 기사의 제목·요약을 번역해 title_ko / desc_ko 에 저장. 번역 실패 시 원문 유지."""
+    arts = [a for v in grouped.values() for a in v if not HANGUL.search(a["title"])]
+
+    def work(a):
+        a["title_ko"] = translate_ko(a["title"])
+        if a["desc"]:
+            a["desc_ko"] = translate_ko(short_desc(a["desc"]))
+
+    with ThreadPoolExecutor(max_workers=6) as ex:
+        list(ex.map(work, arts))
+    done = sum(1 for a in arts if a.get("title_ko"))
+    print(f"  [번역] {done}/{len(arts)}건 번역")
+
+
 def build_html(grouped, errors, hours, now):
     total = sum(len(v) for v in grouped.values())
     sections = []
@@ -159,10 +198,11 @@ def build_html(grouped, errors, hours, now):
         rows = []
         for a in arts:
             when = a["published"].astimezone().strftime("%m/%d %H:%M") if a["published"] else "-"
-            desc = html.escape(a["desc"][:220] + ("…" if len(a["desc"]) > 220 else ""))
+            desc = html.escape(a.get("desc_ko") or short_desc(a["desc"]))
+            orig = f'<div class="orig">{html.escape(a["title"])}</div>' if a.get("title_ko") else ""
             rows.append(
-                f'<li><a href="{html.escape(a["link"])}" target="_blank">{html.escape(a["title"])}</a>'
-                f'<div class="meta">{html.escape(a["source"])} · {when} · '
+                f'<li><a href="{html.escape(a["link"])}" target="_blank">{html.escape(a.get("title_ko") or a["title"])}</a>'
+                f'{orig}<div class="meta">{html.escape(a["source"])} · {when} · '
                 f'<span class="kw">{html.escape(a["keyword"])}</span></div>'
                 f'<p>{desc}</p></li>'
             )
@@ -188,7 +228,7 @@ ul{{list-style:none;padding:0;margin:0}}
 li{{background:var(--card);border:1px solid var(--line);border-radius:8px;padding:12px 14px;margin:10px 0}}
 li a{{color:var(--fg);font-weight:600;text-decoration:none}} li a:hover{{color:var(--accent)}}
 .meta{{color:var(--muted);font-size:12.5px;margin-top:3px}}
-.kw{{color:var(--accent)}}
+.kw{{color:var(--accent)}} .orig{{color:var(--muted);font-size:12.5px;margin-top:2px}}
 li p{{margin:6px 0 0;font-size:13.5px;color:var(--muted)}}
 details{{margin-top:32px;color:var(--muted);font-size:13px}} .empty{{color:var(--muted)}}
 </style></head><body><main>
@@ -231,7 +271,7 @@ def build_telegram_messages(grouped, hours, now, report_url, per_cat=8):
             continue
         lines = [f"\n<b>{cat}</b> ({len(arts)}건)"]
         for a in arts[:per_cat]:
-            lines.append(f'• <a href="{html.escape(a["link"])}">{html.escape(a["title"])}</a>'
+            lines.append(f'• <a href="{html.escape(a["link"])}">{html.escape(a.get("title_ko") or a["title"])}</a>'
                          f' <i>{html.escape(a["source"])}</i>')
         if len(arts) > per_cat:
             lines.append(f"  … 외 {len(arts) - per_cat}건")
@@ -290,6 +330,7 @@ def main():
     ap.add_argument("--report-url", default=os.environ.get("REPORT_URL", ""),
                     help="텔레그램 메시지에 붙일 전체 리포트 주소")
     ap.add_argument("--get-chat-id", action="store_true", help="봇에게 온 메시지에서 chat id 출력")
+    ap.add_argument("--no-translate", action="store_true", help="영문 기사 한국어 번역 끄기")
     args = ap.parse_args()
 
     if args.get_chat_id:
@@ -328,6 +369,9 @@ def main():
     oldest = datetime.min.replace(tzinfo=timezone.utc)
     for arts in grouped.values():
         arts.sort(key=lambda a: a["published"] or oldest, reverse=True)
+
+    if not args.no_translate:
+        translate_articles(grouped)
 
     args.out.mkdir(parents=True, exist_ok=True)
     out = args.out / f"{now:%Y-%m-%d}.html"
