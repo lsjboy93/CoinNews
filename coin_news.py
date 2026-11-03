@@ -25,6 +25,8 @@ import urllib.parse
 import urllib.request
 import webbrowser
 import xml.etree.ElementTree as ET
+
+import upbit
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
@@ -222,7 +224,7 @@ def save_state(path, state, now, keep_days=4):
     path.write_text(json.dumps(state, ensure_ascii=False), encoding="utf-8")
 
 
-def build_html(grouped, errors, hours, now):
+def build_html(grouped, errors, hours, now, upbit_link=False):
     total = sum(len(v) for v in grouped.values())
     sections = []
     for cat in CATEGORIES:
@@ -255,7 +257,7 @@ def build_html(grouped, errors, hours, now):
 @media (prefers-color-scheme:dark){{:root{{--bg:#151515;--fg:#eaeaea;--muted:#9a9a9a;--card:#1f1f1f;--line:#333;--accent:#fb923c}}}}
 body{{margin:0;background:var(--bg);color:var(--fg);font:15px/1.55 system-ui,"Malgun Gothic",sans-serif;padding:24px 16px}}
 main{{max-width:860px;margin:auto}}
-h1{{font-size:22px;margin:0 0 4px}} .sub{{color:var(--muted);margin-bottom:24px}}
+h1{{font-size:22px;margin:0 0 4px}} .sub{{color:var(--muted);margin-bottom:24px}} .sub a{{color:var(--accent)}}
 h2{{font-size:17px;border-bottom:1px solid var(--line);padding-bottom:6px;margin-top:32px}}
 .n{{font-size:13px;color:var(--muted);font-weight:normal}}
 ul{{list-style:none;padding:0;margin:0}}
@@ -267,7 +269,7 @@ li p{{margin:6px 0 0;font-size:13.5px;color:var(--muted)}}
 details{{margin-top:32px;color:var(--muted);font-size:13px}} .empty{{color:var(--muted)}}
 </style></head><body><main>
 <h1>코인 기술·보안 브리핑</h1>
-<div class="sub">{now:%Y년 %m월 %d일 %H:%M} 기준 · 최근 {hours}시간 · 관련 기사 {total}건</div>
+<div class="sub">{now:%Y년 %m월 %d일 %H:%M} 기준 · 최근 {hours}시간 · 관련 기사 {total}건{' · <a href="upbit.html">업비트 지원 네트워크 →</a>' if upbit_link else ''}</div>
 {''.join(sections)}
 {err_html}
 </main></body></html>"""
@@ -324,13 +326,17 @@ def build_telegram_messages(grouped, header, report_url, per_cat=8):
 
 
 def send_telegram(grouped, header, report_url):
+    return send_messages(build_telegram_messages(grouped, header, report_url))
+
+
+def send_messages(messages):
     """전송했거나 설정이 없어 건너뛰면 True, 전송 중 오류면 False."""
     token, chat_id = load_telegram_config()
     if not token or not chat_id:
         print("  [텔레그램] TELEGRAM_BOT_TOKEN / TELEGRAM_CHAT_ID 가 설정되지 않아 건너뜀", file=sys.stderr)
         return True
     try:
-        for msg in build_telegram_messages(grouped, header, report_url):
+        for msg in messages:
             telegram_api(token, "sendMessage", {
                 "chat_id": chat_id, "text": msg, "parse_mode": "HTML",
                 "disable_web_page_preview": True,
@@ -371,6 +377,8 @@ def main():
                     help="텔레그램 메시지에 붙일 전체 리포트 주소")
     ap.add_argument("--get-chat-id", action="store_true", help="봇에게 온 메시지에서 chat id 출력")
     ap.add_argument("--no-translate", action="store_true", help="영문 기사 한국어 번역 끄기")
+    ap.add_argument("--upbit", action="store_true",
+                    help="업비트 지원 네트워크 페이지(upbit.html) 생성, 새 공지·네트워크 변경 알림")
     args = ap.parse_args()
 
     if args.get_chat_id:
@@ -415,8 +423,9 @@ def main():
         state["tr"] = translate_articles(grouped, state["tr"])
 
     args.out.mkdir(parents=True, exist_ok=True)
+    upbit_ok = run_upbit(args, state, now) if args.upbit else True
     out = args.out / f"{now:%Y-%m-%d}.html"
-    out.write_text(build_html(grouped, errors, args.hours, now), encoding="utf-8")
+    out.write_text(build_html(grouped, errors, args.hours, now, upbit_link=args.upbit), encoding="utf-8")
 
     total = sum(len(v) for v in grouped.values())
     print(f"관련 기사 {total}건 → {out}")
@@ -453,8 +462,49 @@ def main():
 
     if not args.no_open:
         webbrowser.open(out.as_uri())
-    if not ok:
+    if not (ok and upbit_ok):
         sys.exit(1)
+
+
+def run_upbit(args, state, now):
+    """업비트 지원 네트워크 페이지 생성 + 새 공지·네트워크 변경 알림. 실패하면 False."""
+    try:
+        rows = upbit.fetch_networks()
+        notices = upbit.fetch_notices()
+    except Exception as e:
+        print(f"  [업비트] 불러오기 실패: {e}", file=sys.stderr)
+        return False
+
+    page = args.out / "upbit.html"
+    page.write_text(upbit.build_page(rows, now), encoding="utf-8")
+    print(f"업비트 코인·네트워크 {len(rows)}개 → {page}")
+
+    first_run = "upbit_notices" not in state
+    seen_ids = set(state.get("upbit_notices", []))
+    new_notices = [n for n in notices if n["id"] not in seen_ids and upbit.is_relevant_notice(n)]
+    new_notices.sort(key=lambda n: n.get("listed_at", ""))
+
+    current = {upbit.network_key(r): r for r in rows}
+    prev = set(state.get("upbit_networks", []))
+    added = [r for k, r in current.items() if prev and k not in prev]
+    removed = sorted(k.replace("@", "(") + ")" for k in prev - current.keys())
+
+    ok = True
+    if args.telegram and not first_run:
+        msgs = upbit.notice_messages(new_notices, rows)
+        change = upbit.network_change_message(added, removed)
+        if change:
+            msgs.append(change)
+        if msgs:
+            ok = send_messages(msgs)
+        print(f"  [업비트] 새 공지 {len(new_notices)}건, 네트워크 추가 {len(added)} / 제외 {len(removed)}")
+    elif first_run:
+        print(f"  [업비트] 첫 실행: 공지 {len(notices)}건을 기록만 하고 알림은 보내지 않음")
+
+    if ok:
+        state["upbit_notices"] = sorted(seen_ids | {n["id"] for n in notices})[-300:]
+        state["upbit_networks"] = sorted(current)
+    return ok
 
 
 if __name__ == "__main__":

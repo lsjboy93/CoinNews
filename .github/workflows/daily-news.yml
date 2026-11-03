@@ -51,8 +51,8 @@ jobs:
           MODE: ${{ github.event.schedule == '0 23 * * *' && 'digest' || inputs.telegram || 'new' }}
         run: |
           export REPORT_URL="https://${GITHUB_REPOSITORY_OWNER}.github.io/${GITHUB_REPOSITORY#*/}/"
-          python coin_news.py --hours 24 --no-open --telegram "$MODE" --out site
-          cp site/*.html site/index.html
+          python coin_news.py --hours 24 --no-open --telegram "$MODE" --upbit --out site
+          cp site/20*.html site/index.html
 
       - name: Save state
         if: always()
