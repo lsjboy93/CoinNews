@@ -21,6 +21,8 @@ import json
 import os
 import re
 import sys
+import time
+import urllib.error
 import urllib.parse
 import urllib.request
 import webbrowser
@@ -160,20 +162,56 @@ def short_desc(text, n=220):
 HANGUL = re.compile("[가-힣]")
 
 
-def translate_ko(text):
-    """Google 번역 웹 엔드포인트(무료, 키 불필요)로 한국어 번역. 실패하면 None."""
-    if not text or HANGUL.search(text):
-        return None
-    url = "https://translate.googleapis.com/translate_a/single?" + urllib.parse.urlencode(
-        {"client": "gtx", "sl": "auto", "tl": "ko", "dt": "t", "q": text})
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": UA})
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            data = json.loads(resp.read())
-        out = "".join(seg[0] for seg in data[0] if seg and seg[0])
-        return out.replace("​", "").strip() or None
-    except Exception:
-        return None
+TRANSLATE_URL = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=ko&dt=t"
+
+
+def _translate_request(text):
+    """Google 번역 웹 엔드포인트(무료, 키 불필요). 429(요청 과다)면 잠시 쉬고 재시도."""
+    body = urllib.parse.urlencode({"q": text}).encode()
+    for wait in (0, 3, 10):
+        time.sleep(wait)
+        try:
+            req = urllib.request.Request(TRANSLATE_URL, data=body, headers={"User-Agent": UA})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read())
+            return "".join(seg[0] for seg in data[0] if seg and seg[0]).replace("​", "")
+        except urllib.error.HTTPError as e:
+            if e.code != 429:
+                return None
+        except Exception:
+            return None
+    return None
+
+
+def translate_batch(texts, max_chars=1800):
+    """여러 문장을 줄바꿈으로 묶어 한 번에 번역 (요청 수를 줄여 차단을 피함). {원문: 번역}"""
+    texts = [t.replace("\n", " ").strip() for t in texts if t and not HANGUL.search(t)]
+    chunks, cur = [], []
+    for t in texts:
+        if cur and sum(len(x) + 1 for x in cur) + len(t) > max_chars:
+            chunks.append(cur)
+            cur = []
+        cur.append(t)
+    if cur:
+        chunks.append(cur)
+
+    result, requests = {}, 0
+    for chunk in chunks:
+        requests += 1
+        out = _translate_request("\n".join(chunk))
+        if out is None:
+            break  # 차단되면 이번 실행은 여기까지 (다음 실행 때 이어서)
+        lines = [s.strip() for s in out.split("\n")]
+        if len(lines) == len(chunk):
+            result.update({src: ko for src, ko in zip(chunk, lines) if ko})
+        else:  # 줄 수가 어긋나면 한 문장씩
+            for src in chunk:
+                requests += 1
+                ko = _translate_request(src)
+                if ko:
+                    result[src] = ko.strip()
+        time.sleep(0.5)
+    return result, requests
 
 
 def translate_articles(grouped, cache):
@@ -182,29 +220,26 @@ def translate_articles(grouped, cache):
     cache(원문 → 번역)에 있는 문장은 다시 요청하지 않고, 이번에 쓴 번역만 담은 새 cache를 돌려줍니다.
     """
     arts = [a for v in grouped.values() for a in v if not HANGUL.search(a["title"])]
-    new_cache, requested = {}, 0
 
-    def tr(text):
-        nonlocal requested
-        if text in cache:
-            ko = cache[text]
-        else:
-            requested += 1
-            ko = translate_ko(text)
-        if ko:
-            new_cache[text] = ko
-        return ko
+    def src(text):
+        return text.replace("\n", " ").strip()
 
-    def work(a):
-        a["title_ko"] = tr(a["title"])
+    texts = []
+    for a in arts:
+        texts.append(src(a["title"]))
         if a["desc"]:
-            a["desc_ko"] = tr(short_desc(a["desc"]))
+            texts.append(src(short_desc(a["desc"])))
+    todo = list(dict.fromkeys(t for t in texts if t not in cache))
+    fresh, requested = translate_batch(todo) if todo else ({}, 0)
+    known = {**cache, **fresh}
 
-    with ThreadPoolExecutor(max_workers=6) as ex:
-        list(ex.map(work, arts))
+    for a in arts:
+        a["title_ko"] = known.get(src(a["title"]))
+        if a["desc"]:
+            a["desc_ko"] = known.get(src(short_desc(a["desc"])))
     done = sum(1 for a in arts if a.get("title_ko"))
     print(f"  [번역] {done}/{len(arts)}건 번역 (새 요청 {requested}건)")
-    return new_cache
+    return {t: known[t] for t in texts if t in known}
 
 
 def load_state(path):
@@ -343,6 +378,8 @@ def send_messages(messages):
             })
     except Exception as e:
         print(f"  [텔레그램] 전송 실패: {e}", file=sys.stderr)
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::error title=Telegram send failed::{e}")
         return False
     print("  [텔레그램] 전송 완료")
     return True
@@ -425,7 +462,8 @@ def main():
     args.out.mkdir(parents=True, exist_ok=True)
     upbit_ok = run_upbit(args, state, now) if args.upbit else True
     out = args.out / f"{now:%Y-%m-%d}.html"
-    out.write_text(build_html(grouped, errors, args.hours, now, upbit_link=args.upbit), encoding="utf-8")
+    upbit_page = args.upbit and (args.out / "upbit.html").exists()
+    out.write_text(build_html(grouped, errors, args.hours, now, upbit_link=upbit_page), encoding="utf-8")
 
     total = sum(len(v) for v in grouped.values())
     print(f"관련 기사 {total}건 → {out}")
@@ -472,8 +510,11 @@ def run_upbit(args, state, now):
         rows = upbit.fetch_networks()
         notices = upbit.fetch_notices()
     except Exception as e:
+        # 업비트 실패로 뉴스 리포트·알림까지 막히지 않도록 경고만 남김 (GitHub Actions 주석으로도 표시)
         print(f"  [업비트] 불러오기 실패: {e}", file=sys.stderr)
-        return False
+        if os.environ.get("GITHUB_ACTIONS"):
+            print(f"::warning title=Upbit fetch failed::{e}")
+        return True
 
     page = args.out / "upbit.html"
     page.write_text(upbit.build_page(rows, now), encoding="utf-8")

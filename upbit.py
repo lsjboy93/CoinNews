@@ -33,8 +33,11 @@ NOTICE_KEYWORDS = re.compile(
 
 def get_json(url):
     req = urllib.request.Request(url, headers={"User-Agent": UA})
-    with urllib.request.urlopen(req, timeout=20) as resp:
-        return json.loads(resp.read())
+    try:
+        with urllib.request.urlopen(req, timeout=20) as resp:
+            return json.loads(resp.read())
+    except Exception as e:
+        raise RuntimeError(f"{url.split('?')[0]} → {e}") from e
 
 
 def fetch_networks():
